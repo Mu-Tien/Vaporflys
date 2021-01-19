@@ -1,0 +1,1322 @@
+---
+title: "Is Vaporfly released by Nike makes speed improvement for runners?"
+author: "Mu-Tien, Lee"
+output:
+    html_document:
+      toc: yes
+      toc_float: true
+---
+
+```{r setup, include=FALSE, linewidth=100}
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE)
+
+```
+
+```{r}
+
+library(DT)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(tidyr)
+library(tidyverse)
+library(coda)
+library(rjags)
+#library(webshot)
+#install.packages("webshot")
+#webshot::install_phantomjs()
+```
+
+# Introduction
+Recently, Nike launched a new line of marathon racing shoes, which are commonly referred to as Vaporflys. Several studies have reported dramatic speed improvements for runners wearing these shoes. I would like to use the **Bayesian approach** to estimate the magnitude of the improvement this shoes make and test whether the advantage on the performance different between gender, runner and course.
+
+# Data
+The data are downloaded from the recent paper <https://www.researchers.one/article/2020-02-14>.
+There are two .csv files, separated by gender and each data set has the marathon times by runner, course and whether they were wearing the Vaporflys shoes.\
+Total of 1690 data points are recorded. After removing the data point that has missing value, 840 records are from 308 men and 778 records are from 270 female. Noted that there are 21 different courses for male and 21 different courses for female. However, they are not the same.
+
+### Data for Male:\
+```{r male dataset}
+#Read in male dataset
+male <- read.csv("men_sampled_shoe.csv")%>% select(-"time")
+junk <- is.na(male$vaporfly)
+male <- male[!junk,]
+
+kable(head(male))
+```
+
+**Courses included in the male dataset:**\
+
+```{r}
+unique(male$marathon)
+```
+
+### Data for Female:\
+```{r female dataset}
+# read in female dataset
+female <- read.csv("women_sampled_shoe.csv")%>% select(-"time")
+junk <- is.na(female$vaporfly)
+female <- female[!junk,]
+kable(head(female))
+
+```
+
+**Courses included in female dataset:**\
+```{r}
+unique(female$marathon)
+```
+
+## Data summary
+```{r plots}
+#set gender variable
+male$Gender <- "Male"
+female$Gender <- "Female"
+
+#combine datasets
+data <- rbind(male, female)
+
+#plot the vaporflys used freq
+ggplot(data = data, aes(x=date))+
+  geom_col(aes(y=vaporfly, fill=vaporfly))+
+  facet_grid(Gender~.)+
+  labs(title = "Vaporflys use count")
+
+#plot average time
+newdata <- data %>% filter(year==c(2018,2019)) %>% group_by(Gender, date, marathon, vaporfly) %>% summarise(average_time=mean(time_minutes))
+ggplot(data = newdata, aes(x=date))+
+  geom_line(aes(y=average_time, color=vaporfly, group=vaporfly))+
+  facet_grid(Gender~.)+geom_point(aes(y=average_time, color=vaporfly))+
+  labs(title = "Average time to finish a marathon")
+
+#averagetime table
+newdata <- spread(newdata, vaporfly, average_time) 
+newdata <- newdata%>% rename(Without_Vaporflys="FALSE", With_Vaporflys="TRUE")
+newdata$Time_different <- newdata$With_Vaporflys-newdata$Without_Vaporflys
+newdata <- newdata %>% filter(!is.na(Time_different))
+kable(newdata, caption = "Time Reduce Between with and without Vaporflys")
+
+```
+\
+In the data summary, we can see that Vaporflys become more popular after 2018. Also, we can discover that sometimes they help the runner but sometimes they don't. Therefore, a more complete research should be done in order to make a conclusion.
+
+# Methods
+Since the data is separated by gender and the courses are different between male and female. I decided to build up two different models for each gender. The response variable is going to be finishing time ($Y_i$)  $i=1,2,...,840$ for male and $i=1,2,...,778$ for female. And the most important  variable in this research is the Vaporflys ($X_i$). Therefore, We set up the Vaporflys as the fix effect to see if it helps runner to finish marathon faster. Also, because of the course ($M_k$) and the runner ($R_j$) are different, I set them as the random effect, therefore, my final model is going to be
+$$Y_i=(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k$$\
+
+$j=1,2,...,308$ for male and $j=1,2,...,270$ for female\
+
+$k=1,2,...,21$ for both male and female
+
+In each model, I'll try 5 different prior\
+(1) Set fix effect has Normal prior and the random effect has double exponential as prior\
+(2) Both Fix and Random effect has normal as prior\
+(3) Let the fix effect using double exponential and random effect using normal as prior\
+(4) Add an intercept term in the model, the intercept has prior using normal distribution centered at the mean of Y, set fix effect as double exponential and random effect as normal\
+(5) Similar to model 4 but change fix effect into normal prior.\
+
+
+# Models
+In this part I will use `R jags` to run the MCMC for each model. 2 chain and 25000 iteration will be run. The first 5000 iteration were discarded as a burn-in and the rest of 20,000 are sampled. For the model checking, I'll show you the trace plot to see if the parameter convergence during the MCMC. Also, Effective sample size , Geweke Diagnostic and Gelman-Rubin statistic will be provided to help us check the convergence of the models. Ideally, the effective sample size should be larger than 1000.
+The absolute Geweke Diagnostic value should beless than 2. And, Gelman-Rubin statistic should be approximately 1 not over 1.1
+
+```{r modeling data}
+# transfer data for modeling
+male <- male %>% select(match_name, marathon, Gender, vaporfly, time_minutes)
+male$runner <- cumsum(!duplicated(male$match_name))
+male$course <- cumsum(!duplicated(male$marathon))
+male$vaporfly <- ifelse(male$vaporfly=="TRUE", 1, 0)
+
+female <- female %>% select(match_name, marathon, Gender, vaporfly, time_minutes)
+female$runner <- cumsum(!duplicated(female$match_name))
+female$course <- cumsum(!duplicated(female$marathon))
+female$vaporfly <- ifelse(female$vaporfly=="TRUE", 1, 0)
+
+```
+
+## Model for Male
+### Model 1
+$$Y_i=(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k+ \epsilon_i$$
+**With Fix effect:**
+$$\beta \sim N(0, 1/1000)$$
+**Random effect:**
+$$\beta^R_j \sim dexp(0, \epsilon_i*\epsilon_R)$$
+$$\beta^M_k \sim dexp(0, \epsilon_i*\epsilon_M)$$
+$$R_j \sim dexp(0, \epsilon_i*\epsilon_r)$$
+$$M_k \sim dexp(0, \epsilon_i*\epsilon_m)$$
+```{r model 1 Male, cache=TRUE, results = 'asis'}
+#set up variables
+Y <- male$time_minutes
+X <- male %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+
+model1_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(mu[i],taue)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                beta ~ dnorm(0, 1000)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ ddexp (0,tau_r*taue)
+                                R[j] ~ ddexp (0,tau_R*taue)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ ddexp (0,tau_m*taue)
+                                M[j] ~ ddexp (0,tau_M*taue)
+                                }
+                                
+                                taue ~ dgamma(0.01,0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],mu[i],taue)
+                                }
+
+                                }")
+
+#run modeling
+model1.M <- jags.model(model1_string, data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model1.M, 5000, progress.bar="none")
+
+params  <- c("beta")
+sample1.M <- coda.samples(model1.M, 
+                        variable.names=params, 
+                        n.iter=25000, progress.bar="none")
+#draw the trace plot
+plot(sample1.M)
+#autocorr.plot(sample1.M)
+#summary(sample1.M)
+
+#compile results
+cat('\n\n **Effective sample size:** \n\n')
+ESS1.M <- effectiveSize(sample1.M)
+ESS1.M
+
+#diagnoize the convergence
+cat('\n\n  **Geweke Diagnostic:**\n\n')
+geweke.diag(sample1.M)
+
+cat('\n\n**Gelman-Rubin statistic:**\n\n')
+gelman.diag(sample1.M)
+
+#compute DIC
+dic1.M <- dic.samples(model1.M,n.iter=25000,progress.bar="none")
+
+# Compute WAIC
+waic1   <- coda.samples(model1.M, 
+                        variable.names=c("like"), 
+                        n.iter=25000, progress.bar="none")
+like1   <- waic1[[1]]
+fbar1   <- colMeans(like1)
+P1      <- sum(apply(log(like1),2,var))
+WAIC1.M   <- -2*sum(log(fbar1))+2*P1
+
+```
+
+
+### Model 2
+$$Y_i=(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k+ \epsilon_i$$
+**With Fix effect:**
+$$\beta \sim N(\mu_\beta, 1/1000)$$
+**Random effect:**
+$$\beta^R_j \sim N(0, \epsilon_R)$$
+$$\beta^M_k \sim N(0, \epsilon_M)$$
+$$R_j \sim N(0, \epsilon_r)$$
+$$M_k \sim N(0, \epsilon_m)$$
+$$\mu_\beta \sim N(0,1/100)$$
+```{r Model 2 Male, cache=TRUE, results = 'asis'}
+#set up variables
+Y <- male$time_minutes
+X <- male %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model2_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(mu[i],tau)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                beta ~ dnorm(mu_beta, taue)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ dnorm (0,tau_r)
+                                R[j] ~ dnorm (0,tau_R)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ dnorm (0,tau_m)
+                                M[j] ~ dnorm (0,tau_M)
+                                }
+                                mu_beta ~ dnorm(0,100)
+                                
+                                taue ~ dgamma(0.01,0.01)
+                                tau ~ dgamma(0.01, 0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],mu[i],tau)
+                                }
+
+                                }")
+
+#run modeling
+model2.M <- jags.model(model2_string,data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model2.M, 5000, progress.bar="none")
+
+params  <- c("beta")
+sample2.M <- coda.samples(model2.M, 
+                        variable.names=params, 
+                        n.iter=25000, progress.bar="none")
+#draw the trace plot
+plot(sample2.M)
+#autocorr.plot(sample2.M)
+#summary(sample2.M)
+
+cat('\n\n**Effective sample size: **\n\n')
+
+#compile results
+ESS2.M <- effectiveSize(sample2.M)
+ESS2.M
+
+#diagnoize the convergence
+cat('\n\n**Geweke Diagnostic:**\n\n')
+geweke.diag(sample2.M)
+
+cat('\n\n**Gelman-Rubin statistic:**\n\n')
+gelman.diag(sample2.M)
+
+#compute DIC
+dic2.M <- dic.samples(model2.M,n.iter=25000,progress.bar="none")
+
+
+# Compute WAIC
+waic2   <- coda.samples(model2.M, 
+                        variable.names=c("like"), 
+                        n.iter=25000, progress.bar="none")
+like2   <- waic2[[1]]
+fbar2   <- colMeans(like2)
+P2      <- sum(apply(log(like2),2,var))
+WAIC2.M   <- -2*sum(log(fbar2))+2*P2
+
+```
+
+### Model 3
+$$Y_i=(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k+ \epsilon_i$$
+**With Fix effect:**
+$$\beta \sim dexp(0, \epsilon_i*\epsilon)$$
+**Random effect:**
+$$\beta^R_j \sim N(0, \epsilon_R)$$
+$$\beta^M_k \sim N(0, \epsilon_M)$$
+$$R_j \sim N(0, \epsilon_r)$$
+$$M_k \sim N(0, \epsilon_m)$$
+
+```{r model 3 Male, cache=TRUE, results = 'asis'}
+#set up variables
+Y <- male$time_minutes
+X <- male %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model3_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(mu[i],taue)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                beta ~ ddexp(0, taue*tau)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ dnorm (0,tau_r)
+                                R[j] ~ dnorm (0,tau_R)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ dnorm (0,tau_m)
+                                M[j] ~ dnorm (0,tau_M)
+                                }
+                                
+                                MU~ dnorm(135, 100)
+                                taue ~ dgamma(0.01,0.01)
+                                tau ~ dgamma(0.01,0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],mu[i],taue)
+                                }
+
+                                }")
+
+#run modeling
+model3.M <- jags.model(model3_string,data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model3.M, 5000, progress.bar="none")
+
+params  <- c("beta")
+sample3.M <- coda.samples(model3.M, 
+                        variable.names=params, 
+                        n.iter=25000, progress.bar="none")
+#draw the trace plot
+plot(sample3.M)
+#autocorr.plot(sample1.M)
+#summary(sample3.M)
+
+cat('\n\n**Effective sample size:**\n\n')
+
+#compile results
+ESS3.M <- effectiveSize(sample3.M)
+ESS3.M
+
+#diagnoize the convergence
+cat('\n\n**Geweke Diagnostic:**\n\n')
+geweke.diag(sample3.M)
+cat('\n\n**Gelman-Rubin statistic:** \n\n')
+gelman.diag(sample3.M)
+
+#compute DIC
+dic3.M <- dic.samples(model3.M,n.iter=25000,progress.bar="none")
+
+# Compute WAIC
+waic3   <- coda.samples(model3.M, 
+                        variable.names=c("like"), 
+                        n.iter=25000, progress.bar="none")
+like3   <- waic3[[1]]
+fbar3   <- colMeans(like3)
+P3      <- sum(apply(log(like3),2,var))
+WAIC3.M   <- -2*sum(log(fbar3))+2*P3
+
+
+```
+
+
+### Model 4
+$$Y_i=\alpha +(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k+ \epsilon_i$$
+**With Fix effect:**
+$$\alpha \sim N(\mu, 1/1000)$$
+$$\beta \sim dexp(0, \epsilon_i*\epsilon)$$
+**Random effect:**
+$$\beta^R_j \sim N(0, \epsilon_R)$$
+$$\beta^M_k \sim N(0, \epsilon_M)$$
+$$R_j \sim N(0, \epsilon_r)$$
+$$M_k \sim N(0, \epsilon_m)$$
+$$\mu \sim N(135, 1/100)$$
+```{r model 4 Male, cache=TRUE, results = 'asis'}
+#set up variables
+Y <- male$time_minutes
+X <- male %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model4_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(alpha+mu[i],taue)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                alpha ~ dnorm(MU, 1000)
+                                beta ~ ddexp(0, taue*tau)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ dnorm (0,tau_r)
+                                R[j] ~ dnorm (0,tau_R)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ dnorm (0,tau_m)
+                                M[j] ~ dnorm (0,tau_M)
+                                }
+                                
+                                MU~ dnorm(135, 100)
+                                taue ~ dgamma(0.01,0.01)
+                                tau ~ dgamma(0.01,0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],alpha+mu[i],taue)
+                                }
+
+                                }")
+
+#run modeling
+model4.M <- jags.model(model4_string,data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model4.M, 5000, progress.bar="none")
+
+params  <- c("beta")
+sample4.M <- coda.samples(model4.M, 
+                        variable.names=params, 
+                        n.iter=25000, progress.bar="none")
+#draw the trace plot
+plot(sample4.M)
+#autocorr.plot(sample4.M)
+#summary(sample4.M)
+
+cat('\n\n**Effective sample size:**\n\n')
+
+#compile results
+ESS4.M <- effectiveSize(sample4.M)
+ESS4.M
+
+#diagnoize the convergence
+cat('\n\n**Geweke Diagnostic:**\n\n')
+geweke.diag(sample4.M)
+cat('\n\n**Gelman-Rubin statistic:**\n\n')
+gelman.diag(sample4.M)
+
+#compute DIC
+dic4.M <- dic.samples(model4.M,n.iter=25000,progress.bar="none")
+
+# Compute WAIC
+waic4   <- coda.samples(model4.M, 
+                        variable.names=c("like"), 
+                        n.iter=25000, progress.bar="none")
+like4   <- waic4[[1]]
+fbar4   <- colMeans(like4)
+P4      <- sum(apply(log(like4),2,var))
+WAIC4.M   <- -2*sum(log(fbar4))+2*P4
+
+
+```
+
+
+### Model 5
+$$Y_i=\alpha+(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k+ \epsilon_i$$
+**With Fix effect:**
+$$\alpha \sim N(\mu, 1/1000)$$
+$$\beta \sim N(0, \epsilon)$$
+**Random effect:**
+$$\beta^R_j \sim N(0, \epsilon_R)$$
+$$\beta^M_k \sim N(0, \epsilon_M)$$
+$$R_j \sim N(0, \epsilon_r)$$
+$$M_k \sim N(0, \epsilon_m)$$
+$$\mu \sim N(135, 1/100)$$
+
+```{r model 5 Male, cache=TRUE, results = 'asis'}
+#set up variables
+Y <- male$time_minutes
+X <- male %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model5_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(alpha+mu[i],taue)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                alpha ~ dnorm(MU, 1000)
+                                beta ~ dnorm(0, tau)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ dnorm (0,tau_r)
+                                R[j] ~ dnorm (0,tau_R)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ dnorm (0,tau_m)
+                                M[j] ~ dnorm (0,tau_M)
+                                }
+                                
+                                MU~ dnorm(135, 100)
+                                taue ~ dgamma(0.01,0.01)
+                                tau ~ dgamma(0.01,0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],alpha+mu[i],taue)
+                                }
+
+                                }")
+
+#run modeling
+model5.M <- jags.model(model5_string,data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model5.M, 5000, progress.bar="none")
+
+params  <- c("beta")
+sample5.M <- coda.samples(model5.M, 
+                        variable.names=params, 
+                        n.iter=25000, progress.bar="none")
+#draw the trace plot
+plot(sample5.M)
+#autocorr.plot(sample5.M)
+#summary(sample5.M)
+
+cat('\n\n **Effective sample size:**\n\n')
+
+#compile results
+ESS5.M <- effectiveSize(sample5.M)
+ESS5.M
+
+#diagnoize the convergence
+cat('\n\n **Geweke Diagnostic:**\n\n')
+geweke.diag(sample5.M)
+cat('\n\n **Gelman-Rubin statistic:** \n\n')
+gelman.diag(sample5.M)
+
+#compute DIC
+dic5.M <- dic.samples(model5.M,n.iter=25000,progress.bar="none")
+
+# Compute WAIC
+waic5   <- coda.samples(model5.M, 
+                        variable.names=c("like"), 
+                        n.iter=25000, progress.bar="none")
+like5   <- waic5[[1]]
+fbar5   <- colMeans(like5)
+P5      <- sum(apply(log(like5),2,var))
+WAIC5.M   <- -2*sum(log(fbar5))+2*P5
+
+
+```
+
+
+## Model for Female
+### Model 1
+$$Y_i=(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k+ \epsilon_i$$
+**With Fix effect:**
+$$\beta \sim N(0, 1/1000)$$
+**Random effect:**
+$$\beta^R_j \sim dexp(0, \epsilon_R*\epsilon_i)$$
+$$\beta^M_k \sim dexp(0, \epsilon_M*\epsilon_i)$$
+$$R_j \sim dexp(0, \epsilon_r*\epsilon_i)$$
+$$M_k \sim dexp(0, \epsilon_m*\epsilon_i)$$
+```{r model 1 Female, cache=TRUE, results='asis'}
+#set up variables
+
+Y <- female$time_minutes
+X <- female %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model1_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(mu[i],taue)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                beta ~ dnorm(0, 1000)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ ddexp (0,tau_r*taue)
+                                R[j] ~ ddexp (0,tau_R*taue)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ ddexp (0,tau_m*taue)
+                                M[j] ~ ddexp (0,tau_M*taue)
+                                }
+                                
+                                taue ~ dgamma(0.01,0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],mu[i],taue)
+                                }
+
+                                }")
+
+#run modeling
+model1.F <- jags.model(model1_string, data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model1.F, 5000, progress.bar="none")
+
+params  <- c("beta")
+sample1.F <- coda.samples(model1.F, 
+                        variable.names=params, 
+                        n.iter=25000, progress.bar="none")
+#draw the trace plot
+plot(sample1.F)
+#autocorr.plot(sample1.F)
+#summary(sample1.F)
+
+#compile results
+cat('\n\n **Effective sample size:**\n\n')
+
+ESS1.F <- effectiveSize(sample1.F)
+ESS1.F
+
+#diagnoize the convergence
+cat('\n\n **Geweke Diagnostic:**\n\n')
+geweke.diag(sample1.F)
+cat('\n\n **Gelman-Rubin statistic:** \n\n')
+gelman.diag(sample1.F)
+
+#compute DIC
+dic1.F <- dic.samples(model1.F,n.iter=25000,progress.bar="none")
+
+
+# Compute WAIC
+waic1   <- coda.samples(model1.F, 
+                        variable.names=c("like"), 
+                        n.iter=25000, progress.bar="none")
+like1   <- waic1[[1]]
+fbar1   <- colMeans(like1)
+P1      <- sum(apply(log(like1),2,var))
+WAIC1.F   <- -2*sum(log(fbar1))+2*P1
+
+```
+
+
+### Model 2
+$$Y_i=(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k+ \epsilon_i$$
+**With Fix effect:**
+$$\beta \sim N(\mu, \epsilon)$$
+**Random effect:**
+$$\beta^R_j \sim N(0, \epsilon_R)$$
+$$\beta^M_k \sim N(0, \epsilon_M)$$
+$$R_j \sim N(0, \epsilon_r)$$
+$$M_k \sim N(0, \epsilon_m)$$
+$$\mu \sim N(0, 1/100)$$
+```{r Model 2 Female, cache=TRUE, results='asis'}
+#set up variables
+Y <- female$time_minutes
+X <- female %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model2_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(mu[i],tau)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                beta ~ dnorm(mu_beta, taue)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ dnorm (0,tau_r)
+                                R[j] ~ dnorm (0,tau_R)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ dnorm (0,tau_m)
+                                M[j] ~ dnorm (0,tau_M)
+                                }
+                                mu_beta ~ dnorm(0,100)
+                                
+                                taue ~ dgamma(0.01,0.01)
+                                tau ~ dgamma(0.01, 0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],mu[i],tau)
+                                }
+
+                                }")
+
+#run modeling
+model2.F <- jags.model(model2_string,data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model2.F, 5000, progress.bar="none")
+
+params  <- c("beta")
+sample2.F <- coda.samples(model2.F, 
+                        variable.names=params, 
+                        n.iter=25000, progress.bar="none")
+#draw the trace plot
+plot(sample2.F)
+#autocorr.plot(sample2.F)
+#summary(sample2.F)
+
+#compile results
+cat('\n\n **Effective sample size:**\n\n')
+
+ESS2.F <- effectiveSize(sample2.F)
+ESS2.F
+
+#diagnoize the convergence
+cat('\n\n **Geweke Diagnostic:**\n\n')
+geweke.diag(sample2.F)
+cat('\n\n **Gelman-Rubin statistic:** \n\n')
+gelman.diag(sample2.F)
+
+#compute DIC
+dic2.F <- dic.samples(model2.F,n.iter=25000,progress.bar="none")
+
+
+# Compute WAIC
+waic2   <- coda.samples(model2.F, 
+                        variable.names=c("like"), 
+                        n.iter=25000, progress.bar="none")
+like2   <- waic2[[1]]
+fbar2   <- colMeans(like2)
+P2      <- sum(apply(log(like2),2,var))
+WAIC2.F   <- -2*sum(log(fbar2))+2*P2
+
+```
+
+
+### Model 3
+$$Y_i=(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k+ \epsilon_i$$
+**With Fix effect:**
+$$\beta \sim dexp(0, \epsilon_i*\epsilon)$$
+**Random effect:**
+$$\beta^R_j \sim N(0, \epsilon_R)$$
+$$\beta^M_k \sim N(0, \epsilon_M)$$
+$$R_j \sim N(0, \epsilon_r)$$
+$$M_k \sim N(0, \epsilon_m)$$
+```{r model 3 Female, cache=TRUE, results='asis'}
+#set up variables
+Y <- female$time_minutes
+X <- female %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model3_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(mu[i],taue)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                beta ~ ddexp(0, taue*tau)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ dnorm (0,tau_r)
+                                R[j] ~ dnorm (0,tau_R)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ dnorm (0,tau_m)
+                                M[j] ~ dnorm (0,tau_M)
+                                }
+                                
+                                MU~ dnorm(135, 100)
+                                taue ~ dgamma(0.01,0.01)
+                                tau ~ dgamma(0.01,0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],mu[i],taue)
+                                }
+
+                                }")
+
+#run modeling
+model3.F <- jags.model(model3_string,data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model3.F, 5000, progress.bar="none")
+
+params  <- c("beta")
+sample3.F <- coda.samples(model3.F, 
+                        variable.names=params, 
+                        n.iter=25000, progress.bar="none")
+#draw the trace plot
+plot(sample3.F)
+#autocorr.plot(sample3.F)
+#summary(sample3.F)
+
+#compile results
+cat('\n\n **Effective sample size:**\n\n')
+
+ESS3.F <- effectiveSize(sample3.F)
+ESS3.F
+
+#diagnoize the convergence
+cat('\n\n **Geweke Diagnostic:**\n\n')
+geweke.diag(sample3.F)
+cat('\n\n **Gelman-Rubin statistic:** \n\n')
+gelman.diag(sample3.F)
+
+#compute DIC
+dic3.F <- dic.samples(model3.F,n.iter=25000,progress.bar="none")
+
+
+# Compute WAIC
+waic3   <- coda.samples(model3.F, 
+                        variable.names=c("like"), 
+                        n.iter=25000, progress.bar="none")
+like3   <- waic3[[1]]
+fbar3   <- colMeans(like3)
+P3      <- sum(apply(log(like3),2,var))
+WAIC3.F   <- -2*sum(log(fbar3))+2*P3
+
+
+```
+
+
+### Model 4
+$$Y_i=\alpha +(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k+ \epsilon_i$$
+**With Fix effect:**
+$$\alpha \sim N(\mu, 1/1000)$$
+$$\beta \sim dexp(0, \epsilon_i*\epsilon)$$
+**Random effect:**
+$$\beta^R_j \sim N(0, \epsilon_R)$$
+$$\beta^M_k \sim N(0, \epsilon_M)$$
+$$R_j \sim N(0, \epsilon_r)$$
+$$M_k \sim N(0, \epsilon_m)$$
+$$\mu \sim N(140, 1/100)$$
+```{r model 4 Female, cache=TRUE, results='asis'}
+#set up variables
+Y <- female$time_minutes
+X <- female %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model4_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(alpha+mu[i],taue)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                alpha ~ dnorm(MU, 1000)
+                                beta ~ ddexp(0, taue*tau)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ dnorm (0,tau_r)
+                                R[j] ~ dnorm (0,tau_R)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ dnorm (0,tau_m)
+                                M[j] ~ dnorm (0,tau_M)
+                                }
+                                
+                                MU~ dnorm(140, 100)
+                                taue ~ dgamma(0.01,0.01)
+                                tau ~ dgamma(0.01,0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],alpha+mu[i],taue)
+                                }
+
+                                }")
+
+#run modeling
+model4.F <- jags.model(model4_string,data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model4.F, 5000, progress.bar="none")
+
+params  <- c("beta")
+sample4.F <- coda.samples(model4.F, 
+                        variable.names=params, 
+                        n.iter=25000, progress.bar="none")
+#draw the trace plot
+plot(sample4.F)
+#autocorr.plot(sample4.F)
+#summary(sample4.F)
+
+#compile results
+cat('\n\n **Effective sample size:**\n\n')
+
+ESS4.F <- effectiveSize(sample4.F)
+ESS4.F
+
+#diagnoize the convergence
+cat('\n\n **Geweke Diagnostic:**\n\n')
+geweke.diag(sample4.F)
+cat('\n\n **Gelman-Rubin statistic:** \n\n')
+gelman.diag(sample4.F)
+
+#compute DIC
+dic4.F <- dic.samples(model4.F,n.iter=25000,progress.bar="none")
+
+
+# Compute WAIC
+waic4   <- coda.samples(model4.F, 
+                        variable.names=c("like"), 
+                        n.iter=25000, progress.bar="none")
+like4   <- waic4[[1]]
+fbar4   <- colMeans(like4)
+P4      <- sum(apply(log(like4),2,var))
+WAIC4.F   <- -2*sum(log(fbar4))+2*P4
+
+
+```
+
+### Model 5
+$$Y_i=\alpha +(\beta+\beta^R_j+\beta^M_k)*X_i+R_j+M_k+ \epsilon_i$$
+**With Fix effect:**
+$$\alpha \sim N(\mu, 1/1000)$$
+$$\beta \sim N(0, \epsilon)$$
+**Random effect:**
+$$\beta^R_j \sim N(0, \epsilon_R)$$
+$$\beta^M_k \sim N(0, \epsilon_M)$$
+$$R_j \sim N(0, \epsilon_r)$$
+$$M_k \sim N(0, \epsilon_m)$$
+$$\mu \sim N(140, 1/100)$$
+```{r model 5 Female, cache=TRUE, results='asis'}
+#set up variables
+Y <- female$time_minutes
+X <- female %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model5_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(alpha+mu[i],taue)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                alpha ~ dnorm(MU, 1000)
+                                beta ~ dnorm(0, tau)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ dnorm (0,tau_r)
+                                R[j] ~ dnorm (0,tau_R)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ dnorm (0,tau_m)
+                                M[j] ~ dnorm (0,tau_M)
+                                }
+                                
+                                MU~ dnorm(140, 100)
+                                taue ~ dgamma(0.01,0.01)
+                                tau ~ dgamma(0.01,0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],alpha+mu[i],taue)
+                                }
+
+                                }")
+
+#run modeling
+model5.F <- jags.model(model5_string,data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model5.F, 5000, progress.bar="none")
+
+params  <- c("beta")
+sample5.F <- coda.samples(model5.F, 
+                        variable.names=params, 
+                        n.iter=25000, progress.bar="none")
+#draw the trace plot
+plot(sample5.F)
+#autocorr.plot(sample5.F)
+#summary(sample5.F)
+
+#compile results
+cat('\n\n **Effective sample size:**\n\n')
+
+ESS5.F <- effectiveSize(sample5.F)
+ESS5.F
+
+#diagnoize the convergence
+cat('\n\n **Geweke Diagnostic:**\n\n')
+geweke.diag(sample5.F)
+cat('\n\n **Gelman-Rubin statistic:** \n\n')
+gelman.diag(sample5.F)
+
+#compute DIC
+dic5.F <- dic.samples(model5.F,n.iter=25000,progress.bar="none")
+
+# Compute WAIC
+waic5   <- coda.samples(model5.F, 
+                        variable.names=c("like"), 
+                        n.iter=25000, progress.bar="none")
+like5   <- waic5[[1]]
+fbar5   <- colMeans(like5)
+P5      <- sum(apply(log(like5),2,var))
+WAIC5.F   <- -2*sum(log(fbar5))+2*P5
+
+
+```
+
+## Model comparision
+After running all the model, we can see that $\beta$ can converge on every prior we choose no matter which gender. Only model 3 fail on the Geweke Diagnostic for both male and female. Next, let's use DIC and WAIC to choose the best model between them.
+
+### DIC
+```{r, results='asis'}
+cat('\n\n **DIC comparision for male:**\n\n')
+list(Model1=dic1.M,Model2=dic2.M,Model3=dic3.M,Model4=dic4.M,Model5=dic5.M)
+
+cat('\n\n **DIC comparision for female:**\n\n')
+list(Model1=dic1.F,Model2=dic2.F,Model3=dic3.F,Model4=dic4.F,Model5=dic5.F)
+
+
+```
+
+### WAIC
+```{r}
+WAIC.Female <- rbind(model1=WAIC1.F,model2=WAIC2.F,model3=WAIC3.F,model4=WAIC4.F,model5=WAIC5.F)
+WAIC.Male <- rbind(model1=WAIC1.M,model2=WAIC2.M,model3=WAIC3.M,model4=WAIC4.M, model5=WAIC5.M)
+
+ kable(cbind(WAIC.Male, WAIC.Female),caption= "WAIC comparision", col.names = c("Male","Female"))
+```
+
+After seeing the DIC and WAIC, I believe model 4 is the best model for both gender.
+
+# Result
+## Male 
+**Fixed Vaporflys effect**
+
+```{r final model for male, cache=TRUE}
+#set up variables
+Y <- male$time_minutes
+X <- male %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model4_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(alpha+mu[i],taue)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                alpha ~ dnorm(MU, 1000)
+                                beta ~ ddexp(0, taue*tau)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ dnorm (0,tau_r)
+                                R[j] ~ dnorm (0,tau_R)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ dnorm (0,tau_m)
+                                M[j] ~ dnorm (0,tau_M)
+                                }
+                                
+                                MU~ dnorm(135, 100)
+                                taue ~ dgamma(0.01,0.01)
+                                tau ~ dgamma(0.01,0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],alpha+mu[i],taue)
+                                }
+
+                                }")
+
+#run modeling
+model4.M <- jags.model(model4_string,data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model4.M, 8000, progress.bar="none")
+
+params  <- c("beta")
+FinalBeta.M <- coda.samples(model4.M, 
+                        variable.names=params, 
+                        n.iter=30000, progress.bar="none")
+parameters <- c("beta_r","beta_m")
+FinalRandom.M <- coda.samples(model4.M, 
+                        variable.names=parameters, 
+                        n.iter=30000, progress.bar="none")
+
+#draw the trace plot
+#plot(FinalBeta.M)
+#autocorr.plot(sample4.M)
+summary(FinalBeta.M)
+sumM <- summary(FinalRandom.M)
+DT::datatable(sumM$quantiles, caption = "Quantiles of random effect (Male)")
+
+```
+
+## Female 
+**Fixed Vaporflys effect**
+```{r final model for female, cache=TRUE}
+#set up variables
+Y <- female$time_minutes
+X <- female %>% select(vaporfly,runner,course)
+
+# set up for JAGS
+n <- length(Y)
+r <- length(unique(X$runner))
+m <- length(unique(X$course))
+
+data <- list(Y=Y, X=X, r=r, m=m, n=n)
+inits <- list(beta=c(mean(Y)))
+model4_string <- textConnection("model{
+                                
+                                # Likelihood
+                                for(i in 1:n){
+                                Y[i] ~ dnorm(alpha+mu[i],taue)
+                                mu[i] <-(beta+ beta_r[X[i,2]] +beta_m[X[i,3]])*X[i,1]+R[X[i,2]]+ M[X[i,3]]
+                                }
+                                
+                                # Priors
+                                alpha ~ dnorm(MU, 1000)
+                                beta ~ ddexp(0, taue*tau)
+                                
+                                for(j in 1:r){
+                                beta_r[j] ~ dnorm (0,tau_r)
+                                R[j] ~ dnorm (0,tau_R)
+                                }
+                                
+                                for(j in 1:m){
+                                beta_m[j] ~ dnorm (0,tau_m)
+                                M[j] ~ dnorm (0,tau_M)
+                                }
+                                
+                                MU~ dnorm(150, 100)
+                                taue ~ dgamma(0.01,0.01)
+                                tau ~ dgamma(0.01,0.01)
+                                tau_r  ~ dgamma(0.01,0.01)
+                                tau_R  ~ dgamma(0.01,0.01)
+                                tau_m  ~ dgamma(0.01,0.01)
+                                tau_M  ~ dgamma(0.01,0.01)
+                                sigma <- sqrt(1/taue)
+
+                                # WAIC calculations
+                                for(i in 1:n){
+                                like[i] <- dnorm(Y[i],alpha+mu[i],taue)
+                                }
+
+                                }")
+
+#run modeling
+model4.F <- jags.model(model4_string,data = data, inits=inits, n.chains=2,quiet=TRUE)
+update(model4.F, 5000, progress.bar="none")
+
+params  <- c("beta")
+FinalBeta.F <- coda.samples(model4.F, 
+                        variable.names=params, 
+                        n.iter=30000, progress.bar="none")
+parameters <- c("beta_r","beta_m")
+FinalRandom.F <- coda.samples(model4.F, 
+                        variable.names=parameters, 
+                        n.iter=30000, progress.bar="none")
+#draw the trace plot
+#plot(FinalBeta.F)
+#autocorr.plot(sample4.F)
+summary(FinalBeta.F)
+sumF <-summary(FinalRandom.F)
+DT::datatable(sumF$quantiles, caption = "Quantiles of random effect (Female)")
+
+```
+
+To conclude, The Vaporflys seem to make a really great improvement for runner no matter for male or female. The $\beta$ has the mean -2 for male and -2.3 for female. That is a incredible improvement for a marathon runner. On the other hand, I will say that the improvement doesn't not have a significantly different between runner and courses. Since all the random effect $\beta_r$ and $\beta_m$ both including 0 in their 95% quantiles.Therefore, this is telling us that the Vaporfly is actually a fix effect.\
+To clarify the improvement between Male and Female, I use the sampled beta to do the t test. And the result show below says that the improvement for male and female are not the same. That is to say, Vaporflys really help a lot for marathon runner especially for women.
+
+```{r}
+MaleBeta<-FinalBeta.M[[1]][,1]
+FemaleBeta<- FinalBeta.F[[1]][,1]
+t.test(MaleBeta,FemaleBeta)
+```
+
